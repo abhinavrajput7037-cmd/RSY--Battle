@@ -1,0 +1,969 @@
+<?php
+/**
+ * RSY Battle — api.php
+ * User-facing API — Firebase RTDB replacement
+ * Uses same MySQL database as admin-api.php
+ */
+require_once __DIR__ . '/db-config.php';
+cors();
+
+$action = $_GET['action'] ?? '';
+$uid    = getUID();           // from X-User-UID header or ?uid=
+$input  = getInput();         // parsed JSON body
+$pdo    = getDB();
+$now    = round(microtime(true) * 1000);
+
+switch ($action) {
+
+// ══════════════════════════════════════════════════════
+// USER PROFILE
+// ══════════════════════════════════════════════════════
+
+case 'getUser': {
+    $tuid = $_GET['uid'] ?? ($input['uid'] ?? $uid);
+    if (!$tuid) jsonOut(['error'=>'No uid'], 400);
+    $s = $pdo->prepare("SELECT * FROM users WHERE uid=?");
+    $s->execute([$tuid]);
+    $u = $s->fetch();
+    jsonOut($u ? ['ok'=>true,'user'=>mapUser($u)] : ['ok'=>false,'error'=>'not_found']);
+    break;
+}
+
+case 'createUser': {
+    $data = $input;
+    $cuid = $data['uid'] ?? $uid;
+    if (!$cuid) jsonOut(['error'=>'No uid'], 400);
+
+    // Ensure optional columns exist
+    $optCols = [
+        "stored_pass VARCHAR(255) DEFAULT ''",
+        "father_name VARCHAR(255) DEFAULT ''",
+        "device_fp VARCHAR(255) DEFAULT ''",
+        "last_spin_date VARCHAR(50) DEFAULT ''",
+        "last_scratch_date VARCHAR(50) DEFAULT ''",
+    ];
+    foreach ($optCols as $colDef) {
+        try { $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS $colDef"); } catch(Exception $ign) {}
+    }
+
+    // Check if already exists
+    $s = $pdo->prepare("SELECT uid FROM users WHERE uid=?");
+    $s->execute([$cuid]);
+    if ($s->fetch()) {
+        // Still update key fields in case partial save happened before
+        $upd = []; $upv = [];
+        if (!empty($data['mobile']))      { $upd[] = "mobile=?";       $upv[] = $data['mobile']; }
+        if (!empty($data['storedPass']))  { $upd[] = "stored_pass=?";  $upv[] = $data['storedPass']; }
+        if (!empty($data['fatherName']))  { $upd[] = "father_name=?";  $upv[] = $data['fatherName']; }
+        if (!empty($data['displayName'])) { $upd[] = "display_name=?"; $upv[] = $data['displayName']; }
+        if (!empty($data['username']))    { $upd[] = "username=?";     $upv[] = $data['username']; }
+        if (!empty($data['email']))       { $upd[] = "email=?";        $upv[] = $data['email']; }
+        if (!empty($upd)) {
+            $upv[] = $cuid;
+            try { $pdo->prepare("UPDATE users SET ".implode(',',$upd)." WHERE uid=?")->execute($upv); } catch(Exception $ign) {}
+        }
+        jsonOut(['ok'=>true,'existed'=>true]);
+        break;
+    }
+
+    // Generate referral code
+    $refCode = strtoupper(substr(md5($cuid . time()), 0, 8));
+
+    // Handle referral
+    $referredBy = '';
+    $referralCode = $data['referralCode'] ?? $data['referred_by'] ?? '';
+    if ($referralCode) {
+        $rs = $pdo->prepare("SELECT uid FROM users WHERE referral_code=? AND uid!=?");
+        $rs->execute([$referralCode, $cuid]);
+        $referrer = $rs->fetch();
+        if ($referrer) $referredBy = $referrer['uid'];
+    }
+
+    $initBalance   = floatval($data['balance']   ?? 0);
+    $initBonusCash = floatval($data['bonusCash'] ?? 0);
+    $initRefBy     = $referredBy ?: ($data['referredBy'] ?? '');
+    $useRefCode    = $data['referralCode'] ?? $refCode;
+    $storedPass    = $data['storedPass']  ?? '';
+    $fatherName    = $data['fatherName']  ?? '';
+
+    try {
+        $pdo->prepare("INSERT INTO users (uid,email,display_name,username,mobile,photo_url,auth_provider,referral_code,referred_by,balance,deposited_amount,winning_cash,bonus_cash,total_earnings,referral_earnings,referral_count,matches_played,matches_won,diamonds,free_match_credits,is_banned,language,stored_pass,father_name,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,0,0,?,0,0,0,0,0,0,0,0,?,?,?,?)")
+            ->execute([$cuid,$data['email']??'',$data['displayName']??'',$data['username']??'',$data['mobile']??'',$data['photoURL']??'',$data['authProvider']??'email',$useRefCode,$initRefBy,$initBalance,$initBonusCash,$data['language']??'hi',$storedPass,$fatherName,$now]);
+    } catch(Exception $e1) {
+        // Fallback without extra cols
+        try {
+            $pdo->prepare("INSERT INTO users (uid,email,display_name,username,mobile,photo_url,auth_provider,referral_code,referred_by,balance,deposited_amount,winning_cash,bonus_cash,total_earnings,referral_earnings,referral_count,matches_played,matches_won,diamonds,free_match_credits,is_banned,language,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,0,0,?,0,0,0,0,0,0,0,0,?,?)")
+                ->execute([$cuid,$data['email']??'',$data['displayName']??'',$data['username']??'',$data['mobile']??'',$data['photoURL']??'',$data['authProvider']??'email',$useRefCode,$initRefBy,$initBalance,$initBonusCash,$data['language']??'hi',$now]);
+            // Save extra fields via UPDATE
+            if ($storedPass || $fatherName) {
+                try { $pdo->prepare("UPDATE users SET stored_pass=?,father_name=? WHERE uid=?")->execute([$storedPass,$fatherName,$cuid]); } catch(Exception $ign) {}
+            }
+        } catch(Exception $e2) {
+            jsonOut(['ok'=>false,'error'=>'DB error: '.$e2->getMessage()], 500); break;
+        }
+    }
+
+    jsonOut(['ok'=>true,'referralCode'=>$useRefCode]);
+    break;
+}
+
+case 'updateUser': {
+    $targetUid = $uid ?: ($input['uid'] ?? '');
+    if (!$targetUid) jsonOut(['error'=>'Unauthorized'], 401);
+    // Ensure optional columns exist
+    $optCols2 = ["stored_pass VARCHAR(255) DEFAULT ''","father_name VARCHAR(255) DEFAULT ''","device_fp VARCHAR(255) DEFAULT ''","last_spin_date VARCHAR(50) DEFAULT ''","last_scratch_date VARCHAR(50) DEFAULT ''"];
+    foreach ($optCols2 as $cd) { try { $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS $cd"); } catch(Exception $ign) {} }
+    $data = $input;
+    $map = [
+        'displayName'=>'display_name','username'=>'username','mobile'=>'mobile',
+        'fatherName'=>'father_name','photoURL'=>'photo_url','language'=>'language',
+        'lastSpinDate'=>'last_spin_date','lastScratchDate'=>'last_scratch_date',
+        'deviceFp'=>'device_fp','storedPass'=>'stored_pass',
+        'balance'=>'balance','depositedAmount'=>'deposited_amount',
+        'winningCash'=>'winning_cash','bonusCash'=>'bonus_cash',
+        'totalEarnings'=>'total_earnings','referralEarnings'=>'referral_earnings',
+        'referralCount'=>'referral_count','matchesPlayed'=>'matches_played',
+        'matchesWon'=>'matches_won','diamonds'=>'diamonds',
+        'freeMatchCredits'=>'free_match_credits',
+        'last_spin_date'=>'last_spin_date','last_scratch_date'=>'last_scratch_date',
+        'referredBy'=>'referred_by','referralCode'=>'referral_code',
+    ];
+    $sets = []; $vals = [];
+    foreach ($data as $k => $v) {
+        if ($k === 'uid') continue;
+        $col = $map[$k] ?? null;
+        if ($col) { $sets[] = "`$col`=?"; $vals[] = $v; }
+    }
+    if (!empty($sets)) {
+        $vals[] = $targetUid;
+        try {
+            $pdo->prepare("UPDATE users SET ".implode(',',$sets)." WHERE uid=?")->execute($vals);
+        } catch(Exception $e) {
+            $safe = ['display_name','username','mobile','photo_url','language','balance','deposited_amount','winning_cash','bonus_cash','total_earnings','referral_earnings','referral_count','matches_played','matches_won','diamonds','free_match_credits','referred_by','referral_code'];
+            $ss=[]; $sv=[];
+            foreach ($sets as $i=>$s) { $col=trim(str_replace(['`','=?'],'',$s)); if(in_array($col,$safe)){$ss[]=$s;$sv[]=$vals[$i];} }
+            if (!empty($ss)) { $sv[]=$targetUid; try{$pdo->prepare("UPDATE users SET ".implode(',',$ss)." WHERE uid=?")->execute($sv);}catch(Exception $e2){} }
+        }
+    }
+    jsonOut(['ok'=>true]);
+    break;
+}
+
+case 'checkUserExists': {
+    $tuid = $_GET['uid'] ?? ($input['uid'] ?? $uid);
+    $s = $pdo->prepare("SELECT uid FROM users WHERE uid=?");
+    $s->execute([$tuid]);
+    jsonOut(['ok'=>true,'exists'=>!!$s->fetch()]);
+    break;
+}
+
+case 'getMobileByEmail': {
+    $email = $_GET['email'] ?? ($input['email'] ?? '');
+    if (!$email) jsonOut(['ok'=>false,'error'=>'No email'], 400);
+    $s = $pdo->prepare("SELECT mobile, auth_provider FROM users WHERE email=? LIMIT 1");
+    $s->execute([trim(strtolower($email))]);
+    $u = $s->fetch();
+    if (!$u || !$u['mobile']) jsonOut(['ok'=>false,'error'=>'not_found']);
+    jsonOut(['ok'=>true,'mobile'=>$u['mobile'],'authProvider'=>$u['auth_provider']??'email']);
+    break;
+}
+
+case 'checkDuplicate': {
+    $email    = strtolower(trim($_GET['email']   ?? ''));
+    $mobile   = trim($_GET['mobile']  ?? '');
+    $username = strtolower(trim($_GET['username'] ?? ''));
+    $excludeUid = $_GET['excludeUid'] ?? '';
+    
+    $conflicts = [];
+    if ($email) {
+        $s = $pdo->prepare("SELECT uid FROM users WHERE email=? AND uid!=?");
+        $s->execute([$email, $excludeUid]);
+        if ($s->fetch()) $conflicts[] = 'email';
+    }
+    if ($mobile) {
+        $s = $pdo->prepare("SELECT uid FROM users WHERE mobile=? AND uid!=?");
+        $s->execute([$mobile, $excludeUid]);
+        if ($s->fetch()) $conflicts[] = 'mobile';
+    }
+    if ($username) {
+        $s = $pdo->prepare("SELECT uid FROM users WHERE LOWER(username)=? AND uid!=?");
+        $s->execute([$username, $excludeUid]);
+        if ($s->fetch()) $conflicts[] = 'username';
+    }
+    jsonOut(['ok'=>true,'conflicts'=>$conflicts,'hasDuplicate'=>!empty($conflicts)]);
+    break;
+}
+
+
+case 'getUserByMobile': {
+    $mobile = $_GET['mobile'] ?? ($input['mobile'] ?? '');
+    if (!$mobile) jsonOut(['ok'=>false,'error'=>'No mobile'], 400);
+    $s = $pdo->prepare("SELECT uid, email, auth_provider FROM users WHERE mobile=? LIMIT 1");
+    $s->execute([trim($mobile)]);
+    $u = $s->fetch();
+    if (!$u) jsonOut(['ok'=>false,'error'=>'not_found']);
+    jsonOut(['ok'=>true,'uid'=>$u['uid'],'email'=>$u['email'],'authProvider'=>$u['auth_provider']??'email']);
+    break;
+}
+
+case 'verifyMobileLogin': {
+    $mobile = trim($input['mobile'] ?? '');
+    $password = $input['password'] ?? '';
+    if (!$mobile || !$password) jsonOut(['ok'=>false,'error'=>'missing_fields'], 400);
+    try {
+        try { $pdo->exec("ALTER TABLE users ADD COLUMN IF NOT EXISTS stored_pass VARCHAR(255) DEFAULT ''"); } catch(Exception $ign) {}
+        $s = $pdo->prepare("SELECT uid, email, auth_provider, is_banned FROM users WHERE mobile=? LIMIT 1");
+        $s->execute([$mobile]); $u = $s->fetch();
+        if (!$u) { jsonOut(['ok'=>false,'error'=>'mobile_not_found']); break; }
+        if (intval($u['is_banned']??0)) { jsonOut(['ok'=>false,'error'=>'banned']); break; }
+        $passOk = true;
+        try {
+            $ps = $pdo->prepare("SELECT stored_pass FROM users WHERE mobile=? LIMIT 1");
+            $ps->execute([$mobile]); $pr = $ps->fetch();
+            $sp = trim($pr['stored_pass']??'');
+            if ($sp !== '') $passOk = ($sp === $password);
+        } catch(Exception $ign) {}
+        if (!$passOk) { jsonOut(['ok'=>false,'error'=>'wrong_password']); break; }
+        jsonOut(['ok'=>true,'uid'=>$u['uid'],'email'=>$u['email'],'authProvider'=>$u['auth_provider']??'email']);
+    } catch(Exception $e) { jsonOut(['ok'=>true,'skipPassCheck'=>true,'email'=>'','uid'=>'']); }
+    break;
+}
+
+case 'getEmailByMobile': {
+    $mobile = trim($input['mobile'] ?? ($_GET['mobile'] ?? ''));
+    if (!$mobile) jsonOut(['ok'=>false,'error'=>'missing_mobile'], 400);
+    $s = $pdo->prepare("SELECT email, is_banned FROM users WHERE mobile=? LIMIT 1");
+    $s->execute([$mobile]); $u = $s->fetch();
+    if (!$u) { jsonOut(['ok'=>false,'error'=>'not_found']); break; }
+    if (intval($u['is_banned']??0)) { jsonOut(['ok'=>false,'error'=>'banned']); break; }
+    jsonOut(['ok'=>true,'email'=>$u['email']]);
+    break;
+}
+
+
+
+case 'walletMultiUpdate': {
+    if (!$uid) jsonOut(['error'=>'Unauthorized'], 401);
+    $map = [
+        'balance'=>'balance','winningCash'=>'winning_cash','bonusCash'=>'bonus_cash',
+        'depositedAmount'=>'deposited_amount','totalEarnings'=>'total_earnings',
+        'referralEarnings'=>'referral_earnings','matchesWon'=>'matches_won',
+        'matchesPlayed'=>'matches_played','freeMatchCredits'=>'free_match_credits',
+        'diamonds'=>'diamonds','referralCount'=>'referral_count',
+    ];
+    $sets = []; $vals = [];
+    foreach ($input as $k => $v) {
+        if ($k === 'uid') continue;
+        $col = $map[$k] ?? null;
+        if ($col) { $sets[] = "`$col`=?"; $vals[] = floatval($v); }
+    }
+    if (!empty($sets)) {
+        $vals[] = $uid;
+        $pdo->prepare("UPDATE users SET ".implode(',',$sets)." WHERE uid=?")->execute($vals);
+    }
+    jsonOut(['ok'=>true]);
+    break;
+}
+
+// ══════════════════════════════════════════════════════
+// TOURNAMENTS
+// ══════════════════════════════════════════════════════
+
+case 'getTournaments': {
+    $status = $_GET['status'] ?? '';
+    $gameId = $_GET['gameId'] ?? $_GET['game_id'] ?? '';
+    $sql = "SELECT * FROM tournaments";
+    $params = [];
+    $where = [];
+    if ($status) { $where[] = "status=?"; $params[] = $status; }
+    if ($gameId) { $where[] = "game_id=?"; $params[] = $gameId; }
+    if ($where) $sql .= " WHERE " . implode(' AND ', $where);
+    $sql .= " ORDER BY created_at DESC";
+    $s = $pdo->prepare($sql); $s->execute($params);
+    $rows = $s->fetchAll();
+    $obj = [];
+    foreach ($rows as $t) $obj[$t['tid']] = mapTournament($t);
+    jsonOut(['ok'=>true,'tournaments'=>$obj]);
+    break;
+}
+
+case 'getTournament': {
+    $tid = $_GET['tid'] ?? ($input['tid'] ?? '');
+    if (!$tid) jsonOut(['ok'=>false,'error'=>'No tid'], 400);
+    $s = $pdo->prepare("SELECT * FROM tournaments WHERE tid=?");
+    $s->execute([$tid]);
+    $t = $s->fetch();
+    jsonOut($t ? ['ok'=>true,'tournament'=>mapTournament($t)] : ['ok'=>false,'error'=>'not_found']);
+    break;
+}
+
+case 'getTournamentPlayers': {
+    $tid = $_GET['tid'] ?? ($input['tid'] ?? '');
+    $s = $pdo->prepare("SELECT * FROM tournaments WHERE tid=?");
+    $s->execute([$tid]);
+    $t = $s->fetch();
+    $players = $t && $t['registered_players'] ? json_decode($t['registered_players'], true) : [];
+    jsonOut(['ok'=>true,'players'=>$players??[]]);
+    break;
+}
+
+case 'getTournamentResults': {
+    $tid = $_GET['tid'] ?? ($input['tid'] ?? '');
+    $s = $pdo->prepare("SELECT * FROM tournament_results WHERE tid=?");
+    $s->execute([$tid]);
+    $r = $s->fetch();
+    if (!$r) jsonOut(['ok'=>false,'error'=>'not_found']);
+    jsonOut(['ok'=>true,'results'=>[
+        'tournamentName'=>$r['tournament_name'],
+        'winners'=>$r['winners']?json_decode($r['winners'],true):[],
+        'prize1st'=>floatval($r['prize_1st']),
+        'prize2nd'=>floatval($r['prize_2nd']),
+        'prize3rd'=>floatval($r['prize_3rd']),
+        'perKillPrize'=>floatval($r['per_kill_prize']),
+        'totalDistributed'=>floatval($r['total_distributed']),
+        'publishedAt'=>intval($r['published_at']),
+    ]]);
+    break;
+}
+
+case 'joinTournament': {
+    if (!$uid) jsonOut(['error'=>'Unauthorized'], 401);
+    $tid = $input['tid'] ?? '';
+    $ign = $input['inGameName'] ?? $input['in_game_name'] ?? '';
+    $gUid = $input['gameUid'] ?? $input['game_uid'] ?? '';
+    if (!$tid) jsonOut(['error'=>'No tid'], 400);
+
+    $s = $pdo->prepare("SELECT * FROM tournaments WHERE tid=?");
+    $s->execute([$tid]);
+    $t = $s->fetch();
+    if (!$t) jsonOut(['ok'=>false,'error'=>'Tournament not found']);
+
+    $players = $t['registered_players'] ? json_decode($t['registered_players'], true) : [];
+    if (isset($players[$uid])) jsonOut(['ok'=>false,'error'=>'Already joined']);
+
+    $maxP = intval($t['max_players']);
+    if ($maxP > 0 && count($players) >= $maxP) jsonOut(['ok'=>false,'error'=>'Tournament full']);
+
+    $players[$uid] = [
+        'uid'=>$uid,'inGameName'=>$ign,'gameUid'=>$gUid,
+        'joinedAt'=>$now,'status'=>'registered'
+    ];
+
+    $pdo->prepare("UPDATE tournaments SET registered_players=? WHERE tid=?")
+        ->execute([json_encode($players), $tid]);
+
+    jsonOut(['ok'=>true]);
+    break;
+}
+
+// ══════════════════════════════════════════════════════
+// GAMES, PROMOTIONS, ANNOUNCEMENTS
+// ══════════════════════════════════════════════════════
+
+case 'getGames': {
+    $s = $pdo->query("SELECT * FROM games ORDER BY sort_order ASC, game_id ASC");
+    $rows = $s->fetchAll();
+    $obj = [];
+    foreach ($rows as $g) {
+        $obj[$g['game_id']] = [
+            'game_id'   => $g['game_id'],
+            'id'        => $g['game_id'],
+            'name'      => $g['name'],
+            'icon'      => $g['icon'] ?? '',
+            'banner'    => $g['banner'] ?? $g['icon'] ?? '',
+            'banner_url'=> $g['banner'] ?? $g['icon'] ?? '',
+            'imageUrl'  => $g['banner'] ?? $g['icon'] ?? '',
+            'active'    => (bool)($g['active'] ?? 1),
+            'sort_order'=> intval($g['sort_order'] ?? 0),
+        ];
+    }
+    jsonOut(['ok'=>true,'games'=>$obj]);
+    break;
+}
+
+case 'getPromotions': {
+    $s = $pdo->query("SELECT * FROM promotions ORDER BY sort_order ASC, id ASC");
+    $rows = $s->fetchAll();
+    $list = [];
+    foreach ($rows as $p) $list[] = ['id'=>$p['id'],'imageUrl'=>$p['image_url'],'link'=>$p['link']];
+    jsonOut(['ok'=>true,'promotions'=>$list]);
+    break;
+}
+
+case 'getAnnouncements': {
+    $s = $pdo->query("SELECT * FROM announcements WHERE active=1 ORDER BY created_at DESC");
+    $rows = $s->fetchAll();
+    $list = [];
+    foreach ($rows as $a) $list[] = [
+        'id'=>$a['id'],'title'=>$a['title'],'description'=>$a['description'],
+        'image_url'=>$a['image_url'],'imageUrl'=>$a['image_url'],
+        'button_link'=>$a['button_link'],'buttonLink'=>$a['button_link'],
+        'button_text'=>$a['button_text'],'buttonText'=>$a['button_text'],
+        'active'=>!!$a['active'],'created_at'=>intval($a['created_at']),'createdAt'=>intval($a['created_at']),
+    ];
+    jsonOut(['ok'=>true,'announcements'=>$list]);
+    break;
+}
+
+// ══════════════════════════════════════════════════════
+// APP SETTINGS & UPDATE
+// ══════════════════════════════════════════════════════
+
+case 'getAppSettings': {
+    $all = getAllSettings();
+    jsonOut(['ok'=>true,'settings'=>$all]);
+    break;
+}
+
+case 'getAppUpdate': {
+    $s = $pdo->query("SELECT * FROM app_update WHERE id=1");
+    $r = $s->fetch();
+    if (!$r) jsonOut(['ok'=>false,'error'=>'not_found']);
+    jsonOut(['ok'=>true,
+        'version'=>$r['version'],
+        'required'=>!!intval($r['required']),
+        'link'=>$r['link'],
+        'whatsNew'=>$r['whats_new']?json_decode($r['whats_new'],true):[],
+    ]);
+    break;
+}
+
+// ══════════════════════════════════════════════════════
+// SMS TICKER, YOUTUBE, LEADERBOARD
+// ══════════════════════════════════════════════════════
+
+case 'getSmsMessages': {
+    $s = $pdo->query("SELECT * FROM sms_messages WHERE active=1 ORDER BY timestamp DESC LIMIT 20");
+    $rows = $s->fetchAll();
+    $list = [];
+    foreach ($rows as $m) $list[] = ['id'=>$m['id'],'message'=>$m['message'],'active'=>!!$m['active'],'timestamp'=>intval($m['timestamp'])];
+    jsonOut(['ok'=>true,'messages'=>$list]);
+    break;
+}
+
+case 'getYoutubeVideos': {
+    $s = $pdo->query("SELECT * FROM youtube_videos ORDER BY sort_order ASC, id DESC LIMIT 20");
+    $rows = $s->fetchAll();
+    jsonOut(['ok'=>true,'videos'=>$rows]);
+    break;
+}
+
+case 'getYoutubeLives': {
+    $s = $pdo->query("SELECT * FROM youtube_lives ORDER BY sort_order ASC, id DESC LIMIT 10");
+    $rows = $s->fetchAll();
+    jsonOut(['ok'=>true,'lives'=>$rows]);
+    break;
+}
+
+case 'getLeaderboard': {
+    $limit = intval($_GET['limit'] ?? 100);
+    $mode = $_GET['mode'] ?? 'lifetime'; // lifetime, today
+
+    if ($mode === 'today') {
+        // Today's earnings = sum of deposits+bonus+wins+spins+scratches (NOT join deductions/withdrawals)
+        // Use IST (UTC+5:30)
+        $todayStart = mktime(0,0,0, date('n'), date('j'), date('Y')) - (5*3600+30*60);
+        $todayStartMs = $todayStart * 1000;
+        $excludeTypes = ['join','tournament_join','withdrawal','deduction'];
+        $placeholders = implode(',', array_fill(0, count($excludeTypes), '?'));
+        $params = array_merge([$todayStartMs], $excludeTypes);
+        $params[] = $limit;
+
+        $sql = "SELECT u.uid, u.display_name, u.username, u.photo_url, u.is_banned,
+                       COALESCE(SUM(CASE WHEN t.amount > 0 THEN t.amount ELSE 0 END), 0) AS today_earn
+                FROM users u
+                LEFT JOIN transactions t ON t.uid = u.uid
+                    AND t.timestamp >= ?
+                    AND t.type NOT IN ($placeholders)
+                WHERE u.is_banned = 0 AND u.display_name != ''
+                GROUP BY u.uid
+                ORDER BY today_earn DESC
+                LIMIT ?";
+
+        $s = $pdo->prepare($sql);
+        $s->execute($params);
+        $rows = $s->fetchAll();
+        $list = [];
+        foreach ($rows as $r) {
+            $list[] = [
+                'uid'          => $r['uid'],
+                'displayName'  => $r['display_name'] ?? '',
+                'display_name' => $r['display_name'] ?? '',
+                'username'     => $r['username'] ?? '',
+                'photoURL'     => $r['photo_url'] ?? '',
+                'photo_url'    => $r['photo_url'] ?? '',
+                'todayEarnings'=> floatval($r['today_earn']),
+                'today_earnings'=> floatval($r['today_earn']),
+                'isBanned'     => false,
+            ];
+        }
+        jsonOut(['ok'=>true,'users'=>$list,'mode'=>'today']);
+    } else {
+        // Lifetime mode — use total_earnings column
+        $s = $pdo->prepare("SELECT * FROM users WHERE is_banned=0 AND display_name!='' ORDER BY total_earnings DESC LIMIT ?");
+        $s->execute([$limit]);
+        $rows = $s->fetchAll();
+        $list = [];
+        foreach ($rows as $u) $list[] = mapUser($u);
+        jsonOut(['ok'=>true,'users'=>$list,'mode'=>'lifetime']);
+    }
+    break;
+}
+
+case 'getTop3': {
+    $s = $pdo->query("SELECT * FROM users WHERE is_banned=0 AND display_name!='' ORDER BY total_earnings DESC LIMIT 3");
+    $rows = $s->fetchAll();
+    $list = [];
+    foreach ($rows as $u) $list[] = mapUser($u);
+    jsonOut(['ok'=>true,'users'=>$list,'top3'=>$list]);
+    break;
+}
+
+// ══════════════════════════════════════════════════════
+// SPIN & SCRATCH
+// ══════════════════════════════════════════════════════
+
+case 'getSpinItems': {
+    $s = $pdo->query("SELECT * FROM spin_items ORDER BY id ASC");
+    $rows = $s->fetchAll();
+    $obj = [];
+    foreach ($rows as $item) $obj[$item['id']] = $item;
+    jsonOut(['ok'=>true,'items'=>$obj]);
+    break;
+}
+
+case 'getScratchPrizes': {
+    $s = $pdo->query("SELECT * FROM scratch_prizes ORDER BY id ASC");
+    $rows = $s->fetchAll();
+    $obj = [];
+    foreach ($rows as $p) $obj[$p['id']] = $p;
+    jsonOut(['ok'=>true,'prizes'=>$obj]);
+    break;
+}
+
+// ══════════════════════════════════════════════════════
+// NOTIFICATIONS
+// ══════════════════════════════════════════════════════
+
+case 'getNotifications': {
+    if (!$uid) jsonOut(['ok'=>false,'notifications'=>[]]);
+    $limit = intval($_GET['limit'] ?? 50);
+    $s = $pdo->prepare("SELECT * FROM notifications WHERE uid=? ORDER BY timestamp DESC LIMIT ?");
+    $s->execute([$uid, $limit]);
+    $rows = $s->fetchAll();
+    $list = [];
+    foreach ($rows as $n) $list[] = [
+        'id'=>$n['id'],'title'=>$n['title'],'message'=>$n['message'],'type'=>$n['type'],
+        'is_read'=>!!$n['is_read'],'read'=>!!$n['is_read'],'timestamp'=>intval($n['timestamp']),
+        'redeem_code'=>$n['redeem_code']??'','redeemCode'=>$n['redeem_code']??'',
+        'gift_card'=>$n['gift_card']??'','giftCard'=>$n['gift_card']??'',
+        'pin_code'=>$n['pin_code']??'','pinCode'=>$n['pin_code']??'',
+        'payment_details'=>$n['payment_details']??'','paymentDetails'=>$n['payment_details']??'',
+    ];
+    jsonOut(['ok'=>true,'notifications'=>$list]);
+    break;
+}
+
+case 'addNotification': {
+    if (!$uid) jsonOut(['error'=>'Unauthorized'], 401);
+    $tuid = $input['uid'] ?? $uid;
+    $pdo->prepare("INSERT INTO notifications (uid,title,message,type,is_read,timestamp) VALUES (?,?,?,?,0,?)")
+        ->execute([$tuid,$input['title']??'',$input['message']??'',$input['type']??'',$input['timestamp']??$now]);
+    jsonOut(['ok'=>true,'id'=>$pdo->lastInsertId()]);
+    break;
+}
+
+case 'markNotifRead': {
+    if (!$uid) jsonOut(['error'=>'Unauthorized'], 401);
+    $nid = $input['notifId'] ?? $_GET['notifId'] ?? '';
+    if ($nid) {
+        $pdo->prepare("UPDATE notifications SET is_read=1 WHERE id=? AND uid=?")->execute([$nid, $uid]);
+    }
+    jsonOut(['ok'=>true]);
+    break;
+}
+
+case 'hasUnreadNotifs': {
+    if (!$uid) jsonOut(['ok'=>true,'hasUnread'=>false]);
+    $s = $pdo->prepare("SELECT COUNT(*) FROM notifications WHERE uid=? AND is_read=0");
+    $s->execute([$uid]);
+    jsonOut(['ok'=>true,'hasUnread'=>$s->fetchColumn()>0]);
+    break;
+}
+
+// ══════════════════════════════════════════════════════
+// TRANSACTIONS
+// ══════════════════════════════════════════════════════
+
+case 'getTransactions': {
+    if (!$uid) jsonOut(['ok'=>false,'transactions'=>[]]);
+    $limit = intval($_GET['limit'] ?? 50);
+    $s = $pdo->prepare("SELECT * FROM transactions WHERE uid=? ORDER BY timestamp DESC LIMIT ?");
+    $s->execute([$uid, $limit]);
+    $rows = $s->fetchAll();
+    $list = [];
+    foreach ($rows as $t) $list[] = [
+        'id'=>$t['id'],'type'=>$t['type'],'amount'=>floatval($t['amount']),
+        'walletType'=>$t['wallet_type']??'','wallet_type'=>$t['wallet_type']??'',
+        'description'=>$t['description'],'timestamp'=>intval($t['timestamp']),
+        'tournamentId'=>$t['tournament_id']??'',
+    ];
+    jsonOut(['ok'=>true,'transactions'=>$list]);
+    break;
+}
+
+case 'addTransaction': {
+    if (!$uid) jsonOut(['error'=>'Unauthorized'], 401);
+    $tuid = $input['uid'] ?? $uid;
+    $pdo->prepare("INSERT INTO transactions (uid,type,amount,wallet_type,description,tournament_id,timestamp) VALUES (?,?,?,?,?,?,?)")
+        ->execute([$tuid,$input['type']??'',floatval($input['amount']??0),$input['walletType']??$input['wallet_type']??'',$input['description']??'',$input['tournamentId']??'',$input['timestamp']??$now]);
+    jsonOut(['ok'=>true,'id'=>$pdo->lastInsertId()]);
+    break;
+}
+
+// ══════════════════════════════════════════════════════
+// DEPOSITS
+// ══════════════════════════════════════════════════════
+
+case 'createDeposit': {
+    if (!$uid) jsonOut(['error'=>'Unauthorized'], 401);
+    $orderId = $input['orderId'] ?? $input['order_id'] ?? ('ORD'.time().rand(100,999));
+    $s = $pdo->prepare("SELECT order_id FROM deposit_requests WHERE order_id=?");
+    $s->execute([$orderId]);
+    if ($s->fetch()) { jsonOut(['ok'=>true,'existed'=>true,'orderId'=>$orderId]); break; }
+
+    $su = $pdo->prepare("SELECT display_name,mobile,email FROM users WHERE uid=?");
+    $su->execute([$uid]); $u = $su->fetch();
+
+    $pdo->prepare("INSERT INTO deposit_requests (order_id,uid,amount,status,gateway,user_name,mobile,email,timestamp) VALUES (?,?,?,?,?,?,?,?,?)")
+        ->execute([$orderId,$uid,floatval($input['amount']??0),'pending',$input['gateway']??'upi',$u['display_name']??'',$u['mobile']??'',$u['email']??'',$now]);
+    jsonOut(['ok'=>true,'orderId'=>$orderId]);
+    break;
+}
+
+case 'updateDeposit': {
+    if (!$uid) jsonOut(['error'=>'Unauthorized'], 401);
+    $orderId = $input['orderId'] ?? $input['order_id'] ?? '';
+    $map = ['status'=>'status','utr'=>'utr','screenshotUrl'=>'screenshot_url','paidAmount'=>'paid_amount','paidAt'=>'paid_at'];
+    $sets=[]; $vals=[];
+    foreach ($input as $k=>$v) { $col=$map[$k]??null; if($col){$sets[]="`$col`=?";$vals[]=$v;} }
+    if (!empty($sets)) { $vals[]=$orderId; $vals[]=$uid; $pdo->prepare("UPDATE deposit_requests SET ".implode(',',$sets)." WHERE order_id=? AND uid=?")->execute($vals); }
+    jsonOut(['ok'=>true]);
+    break;
+}
+
+case 'deleteDeposit': {
+    if (!$uid) jsonOut(['error'=>'Unauthorized'], 401);
+    $orderId = $input['orderId'] ?? $input['order_id'] ?? '';
+    $pdo->prepare("DELETE FROM deposit_requests WHERE order_id=? AND uid=? AND status='pending'")->execute([$orderId,$uid]);
+    jsonOut(['ok'=>true]);
+    break;
+}
+
+case 'getDeposit': {
+    if (!$uid) jsonOut(['ok'=>false]);
+    $orderId = $_GET['orderId'] ?? '';
+    $s = $pdo->prepare("SELECT * FROM deposit_requests WHERE order_id=? AND uid=?");
+    $s->execute([$orderId, $uid]);
+    $d = $s->fetch();
+    jsonOut($d ? ['ok'=>true,'deposit'=>mapDeposit($d)] : ['ok'=>false,'error'=>'not_found']);
+    break;
+}
+
+case 'getPaymentHistory': {
+    if (!$uid) jsonOut(['ok'=>false,'deposits'=>[]]);
+    $s = $pdo->prepare("SELECT * FROM deposit_requests WHERE uid=? ORDER BY timestamp DESC LIMIT 50");
+    $s->execute([$uid]);
+    $rows = $s->fetchAll();
+    $list = [];
+    foreach ($rows as $d) $list[] = mapDeposit($d);
+    jsonOut(['ok'=>true,'deposits'=>$list]);
+    break;
+}
+
+// ══════════════════════════════════════════════════════
+// WITHDRAWALS
+// ══════════════════════════════════════════════════════
+
+case 'createWithdrawal': {
+    if (!$uid) jsonOut(['error'=>'Unauthorized'], 401);
+    $pd = $input['paymentDetails'] ?? [];
+    $pdo->prepare("INSERT INTO withdrawals (uid,amount,method,upi_id,whatsapp,display_name,email,status,timestamp) VALUES (?,?,?,?,?,?,?,'pending',?)")
+        ->execute([$uid,floatval($input['amount']??0),$pd['method']??$input['method']??'',$pd['upiId']??$input['upiId']??'',$input['whatsapp']??'',$input['displayName']??'',$input['email']??'',$now]);
+    jsonOut(['ok'=>true,'id'=>$pdo->lastInsertId()]);
+    break;
+}
+
+case 'getWithdrawals': {
+    if (!$uid) jsonOut(['ok'=>false,'withdrawals'=>[]]);
+    $s = $pdo->prepare("SELECT * FROM withdrawals WHERE uid=? ORDER BY timestamp DESC LIMIT 50");
+    $s->execute([$uid]);
+    $rows = $s->fetchAll();
+    $list = [];
+    foreach ($rows as $w) $list[] = mapWithdrawal($w);
+    jsonOut(['ok'=>true,'withdrawals'=>$list]);
+    break;
+}
+
+// ══════════════════════════════════════════════════════
+// REFERRALS
+// ══════════════════════════════════════════════════════
+
+case 'getReferrals': {
+    if (!$uid) jsonOut(['ok'=>false,'referrals'=>[]]);
+    $s = $pdo->prepare("SELECT * FROM users WHERE referred_by=? ORDER BY created_at DESC");
+    $s->execute([$uid]);
+    $rows = $s->fetchAll();
+    $list = [];
+    foreach ($rows as $u) $list[] = ['uid'=>$u['uid'],'displayName'=>$u['display_name'],'createdAt'=>intval($u['created_at']),'joinedAt'=>intval($u['created_at'])];
+    jsonOut(['ok'=>true,'referrals'=>$list]);
+    break;
+}
+
+case 'addReferral': {
+    // This is handled during createUser — kept for compatibility
+    jsonOut(['ok'=>true]);
+    break;
+}
+
+case 'findReferralCode': {
+    $code = $_GET['code'] ?? ($input['code'] ?? '');
+    if (!$code) jsonOut(['ok'=>false]);
+    $s = $pdo->prepare("SELECT uid,display_name FROM users WHERE referral_code=?");
+    $s->execute([$code]);
+    $u = $s->fetch();
+    jsonOut($u ? ['ok'=>true,'uid'=>$u['uid'],'displayName'=>$u['display_name']] : ['ok'=>false]);
+    break;
+}
+
+// ══════════════════════════════════════════════════════
+// PENDING WINNINGS
+// ══════════════════════════════════════════════════════
+
+case 'getPendingWinnings': {
+    if (!$uid) jsonOut(['ok'=>false,'winnings'=>[]]);
+    $s = $pdo->prepare("SELECT * FROM pending_winnings WHERE uid=? AND (credited=0 OR credited IS NULL)");
+    $s->execute([$uid]);
+    $rows = $s->fetchAll();
+    $list = [];
+    foreach ($rows as $w) $list[] = [
+        'id'=>$w['id'],'uid'=>$w['uid'],'amount'=>floatval($w['amount']),
+        'description'=>$w['description']??'','tournamentId'=>$w['tournament_id']??'',
+        'tournamentName'=>$w['tournament_name']??'','credited'=>!!$w['credited'],
+        'creditedAt'=>intval($w['credited_at']??0),'createdAt'=>intval($w['created_at']??0),
+    ];
+    jsonOut(['ok'=>true,'winnings'=>$list]);
+    break;
+}
+
+case 'creditPendingWinning': {
+    if (!$uid) jsonOut(['error'=>'Unauthorized'], 401);
+    $pendingId = $input['pendingId'] ?? '';
+    if ($pendingId) {
+        $pdo->prepare("UPDATE pending_winnings SET credited=1, credited_at=? WHERE id=? AND uid=?")
+            ->execute([$now, $pendingId, $uid]);
+    }
+    jsonOut(['ok'=>true]);
+    break;
+}
+
+// ══════════════════════════════════════════════════════
+// STAFF CHECK
+// ══════════════════════════════════════════════════════
+
+case 'checkStaff': {
+    $tuid = $_GET['uid'] ?? ($input['uid'] ?? $uid);
+    $s = $pdo->prepare("SELECT uid FROM staff_list WHERE uid=?");
+    $s->execute([$tuid]);
+    jsonOut(['ok'=>true,'isStaff'=>!!$s->fetch()]);
+    break;
+}
+
+// ══════════════════════════════════════════════════════
+// DEVICE FINGERPRINT (anti-fraud)
+// ══════════════════════════════════════════════════════
+
+case 'checkDeviceFp': {
+    $fp = $_GET['fp'] ?? ($input['fp'] ?? '');
+    if (!$fp) jsonOut(['ok'=>true,'exists'=>false]);
+    $s = $pdo->prepare("SELECT uid FROM users WHERE device_fp=? AND uid!=?");
+    $s->execute([$fp, $uid]);
+    $existing = $s->fetch();
+    jsonOut(['ok'=>true,'exists'=>!!$existing,'existingUid'=>$existing?$existing['uid']:'']);
+    break;
+}
+
+case 'registerDeviceFp': {
+    if (!$uid) jsonOut(['error'=>'Unauthorized'], 401);
+    $fp = $input['fp'] ?? $input['deviceFp'] ?? '';
+    if ($fp) {
+        $pdo->prepare("UPDATE users SET device_fp=? WHERE uid=?")->execute([$fp, $uid]);
+    }
+    jsonOut(['ok'=>true]);
+    break;
+}
+
+// ══════════════════════════════════════════════════════
+// ERROR REPORTING (from user app)
+// ══════════════════════════════════════════════════════
+
+case 'reportError': {
+    $data = $input;
+    try {
+        $pdo->prepare("INSERT INTO admin_error_log (source,level,title,detail,url,user_agent,timestamp) VALUES (?,?,?,?,?,?,?)")
+            ->execute([$data['source']??'USER_APP',$data['level']??'error',substr($data['title']??'',0,200),substr($data['detail']??'',0,500),$data['url']??'',$data['userAgent']??'',$now]);
+    } catch(Exception $e) {} // Silently fail — don't break the app
+    jsonOut(['ok'=>true]);
+    break;
+}
+
+// ══════════════════════════════════════════════════════
+// DEFAULT
+// ══════════════════════════════════════════════════════
+
+default:
+    jsonOut(['error'=>'Unknown action: '.$action], 400);
+}
+
+// ══════════════════════════════════════════════════════
+// HELPER MAPPERS
+// ══════════════════════════════════════════════════════
+
+function mapUser($u) {
+    $bal = floatval($u['balance'] ?? 0);
+    // If balance column is 0 but sub-wallets exist, calculate it
+    $dep = floatval($u['deposited_amount'] ?? 0);
+    $win = floatval($u['winning_cash'] ?? 0);
+    $bon = floatval($u['bonus_cash'] ?? 0);
+    if ($bal == 0 && ($dep + $win + $bon) > 0) $bal = $dep + $win + $bon;
+    return [
+        'uid'=>$u['uid'],
+        'email'=>$u['email']??'',
+        'displayName'=>$u['display_name']??'',
+        'display_name'=>$u['display_name']??'',
+        'username'=>$u['username']??'',
+        'mobile'=>$u['mobile']??'',
+        'fatherName'=>$u['father_name']??'',
+        'father_name'=>$u['father_name']??'',
+        'photoURL'=>$u['photo_url']??'',
+        'photo_url'=>$u['photo_url']??'',
+        'storedPass'=>$u['stored_pass']??'',
+        'stored_pass'=>$u['stored_pass']??'',
+        'referralCode'=>$u['referral_code']??'',
+        'referral_code'=>$u['referral_code']??'',
+        'referredBy'=>$u['referred_by']??'',
+        'referred_by'=>$u['referred_by']??'',
+        'balance'=>$bal,
+        'depositedAmount'=>$dep,
+        'deposited_amount'=>$dep,
+        'winningCash'=>$win,
+        'winning_cash'=>$win,
+        'bonusCash'=>$bon,
+        'bonus_cash'=>$bon,
+        'totalEarnings'=>floatval($u['total_earnings']??0),
+        'total_earnings'=>floatval($u['total_earnings']??0),
+        'referralEarnings'=>floatval($u['referral_earnings']??0),
+        'referral_earnings'=>floatval($u['referral_earnings']??0),
+        'referralCount'=>intval($u['referral_count']??0),
+        'referral_count'=>intval($u['referral_count']??0),
+        'matchesPlayed'=>intval($u['matches_played']??0),
+        'matches_played'=>intval($u['matches_played']??0),
+        'matchesWon'=>intval($u['matches_won']??0),
+        'matches_won'=>intval($u['matches_won']??0),
+        'diamonds'=>intval($u['diamonds']??0),
+        'freeMatchCredits'=>intval($u['free_match_credits']??0),
+        'free_match_credits'=>intval($u['free_match_credits']??0),
+        'language'=>$u['language']??'hi',
+        'deviceFp'=>$u['device_fp']??'',
+        'device_fp'=>$u['device_fp']??'',
+        'lastSpinDate'=>$u['last_spin_date']??'',
+        'last_spin_date'=>$u['last_spin_date']??'',
+        'lastScratchDate'=>$u['last_scratch_date']??'',
+        'last_scratch_date'=>$u['last_scratch_date']??'',
+        'authProvider'=>$u['auth_provider']??'',
+        'auth_provider'=>$u['auth_provider']??'',
+        'isBanned'=>!!intval($u['is_banned']??0),
+        'is_banned'=>!!intval($u['is_banned']??0),
+        'createdAt'=>intval($u['created_at']??0),
+        'created_at'=>intval($u['created_at']??0),
+    ];
+}
+
+function mapTournament($t) {
+    return [
+        'tid'=>$t['tid'],
+        'name'=>$t['name']??'',
+        'gameId'=>$t['game_id']??'',
+        'game_id'=>$t['game_id']??'',
+        'entryFee'=>floatval($t['entry_fee']??0),
+        'entry_fee'=>floatval($t['entry_fee']??0),
+        'prizePool'=>floatval($t['prize_pool']??0),
+        'prize_pool'=>floatval($t['prize_pool']??0),
+        'prize1st'=>floatval($t['prize_1st']??0),
+        'prize_1st'=>floatval($t['prize_1st']??0),
+        'prize2nd'=>floatval($t['prize_2nd']??0),
+        'prize3rd'=>floatval($t['prize_3rd']??0),
+        'perKillPrize'=>floatval($t['per_kill_prize']??0),
+        'per_kill_prize'=>floatval($t['per_kill_prize']??0),
+        'maxPlayers'=>intval($t['max_players']??0),
+        'max_players'=>intval($t['max_players']??0),
+        'status'=>$t['status']??'upcoming',
+        'map'=>$t['map_name']??'',
+        'map_name'=>$t['map_name']??'',
+        'roomId'=>$t['room_id']??'',
+        'room_id'=>$t['room_id']??'',
+        'roomPassword'=>$t['room_pass']??'',
+        'room_pass'=>$t['room_pass']??'',
+        'startTime'=>intval($t['start_time']??0),
+        'start_time'=>intval($t['start_time']??0),
+        'bannerUrl'=>$t['banner_url']??'',
+        'banner_url'=>$t['banner_url']??'',
+        'showIdPass'=>!!intval($t['show_id_pass']??0),
+        'show_id_pass'=>!!intval($t['show_id_pass']??0),
+        'registeredPlayers'=>$t['registered_players']?json_decode($t['registered_players'],true):[],
+        'registered_players'=>$t['registered_players']?json_decode($t['registered_players'],true):[],
+        'results'=>$t['results']?json_decode($t['results'],true):null,
+        'createdBy'=>$t['created_by']??'',
+        'createdAt'=>intval($t['created_at']??0),
+    ];
+}
+
+function mapDeposit($d) {
+    return [
+        'orderId'=>$d['order_id'],'order_id'=>$d['order_id'],
+        'amount'=>floatval($d['amount']??0),
+        'paidAmount'=>floatval($d['paid_amount']??0),'paid_amount'=>floatval($d['paid_amount']??0),
+        'status'=>$d['status']??'pending',
+        'gateway'=>$d['gateway']??'',
+        'utr'=>$d['utr']??'',
+        'uid'=>$d['uid'],
+        'userName'=>$d['user_name']??'','user_name'=>$d['user_name']??'',
+        'mobile'=>$d['mobile']??'',
+        'email'=>$d['email']??'',
+        'screenshotUrl'=>$d['screenshot_url']??'','screenshot_url'=>$d['screenshot_url']??'',
+        'timestamp'=>intval($d['timestamp']??0),
+        'paidAt'=>intval($d['paid_at']??0),'paid_at'=>intval($d['paid_at']??0),
+        'upiId'=>$d['upi_id']??'','upi_id'=>$d['upi_id']??'',
+    ];
+}
+
+function mapWithdrawal($w) {
+    return [
+        'id'=>$w['id'],
+        'amount'=>floatval($w['amount']??0),
+        'method'=>$w['method']??'',
+        'upiId'=>$w['upi_id']??'','upi_id'=>$w['upi_id']??'',
+        'status'=>$w['status']??'pending',
+        'displayName'=>$w['display_name']??'','display_name'=>$w['display_name']??'',
+        'email'=>$w['email']??'',
+        'whatsapp'=>$w['whatsapp']??'',
+        'adminNote'=>$w['admin_note']??'','admin_note'=>$w['admin_note']??'',
+        'uid'=>$w['uid'],
+        'timestamp'=>intval($w['timestamp']??0),
+        'processedAt'=>intval($w['processed_at']??0),'processed_at'=>intval($w['processed_at']??0),
+        'redeemCode'=>$w['redeem_code']??'','redeem_code'=>$w['redeem_code']??'',
+        'giftCard'=>$w['gift_card']??'','gift_card'=>$w['gift_card']??'',
+        'pinCode'=>$w['pin_code']??'','pin_code'=>$w['pin_code']??'',
+        'paymentDetails'=>['method'=>$w['method']??'','upiId'=>$w['upi_id']??'','whatsapp'=>$w['whatsapp']??''],
+    ];
+}
